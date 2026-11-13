@@ -5,8 +5,9 @@ import pytest
 
 from uvrev import commands
 from uvrev.commands import uv, uv_environ
+from uvrev.exceptions import SubprocessFailure
 from uvrev.settings import Settings
-from uvrev.types import SubprocessFailure, UVRevProject
+from uvrev.types import UVRevProject
 
 
 class Command(Protocol):
@@ -19,7 +20,7 @@ class TestFailing:
         [pytest.param(commands.git, id="git"), pytest.param(commands.uv, id="uv")],
     )
     def test_fail(self, cmd: Command, tmp_path: Path) -> None:
-        proj = UVRevProject(tmp_path)
+        proj = UVRevProject(tmp_path, Settings())
         with pytest.raises(SubprocessFailure):
             cmd("not-a-valid-command", project=proj)
 
@@ -50,7 +51,7 @@ class TestUV:
     ) -> None:
         """A really activated other venv does not change the project's venv"""
         monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "other" / ".venv"))
-        project = UVRevProject(tmp_path)
+        project = UVRevProject(tmp_path, Settings())
 
         output = uv("--version", project=project, capture_output=True)
 

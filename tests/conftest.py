@@ -9,7 +9,8 @@ import pytest
 from click.testing import CliRunner, Result
 
 import uvrev.cli
-from uvrev import constants, operations, settings
+from uvrev import constants, environment, operations, revisions
+from uvrev.settings import Settings
 from uvrev.types import UVRevProject
 
 
@@ -44,7 +45,7 @@ def isolate_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             monkeypatch.delenv(name)
     # platformdirs uses XDG_CONFIG_HOME on Linux (CI), not on macOS or Windows
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    config_file = settings.config_file()
+    config_file = constants.config_file()
     assert config_file.is_relative_to(tmp_path), "settings are not isolated"
     return config_file
 
@@ -102,18 +103,25 @@ def invoke() -> Invoker:
 @pytest.fixture
 def sample_project(fake_basedir: Path, data_dir: Path) -> UVRevProject:
     """Create a project with a lock file that is not yet installed"""
-    proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV)
-    operations.create_env(fake_basedir, constants.DEFAULT_ENV)
+    proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV, Settings())
+    environment.create_env(fake_basedir, constants.DEFAULT_ENV, Settings())
     shutil.copytree(data_dir / "sample", proj.project_path, dirs_exist_ok=True)
-    operations.create_revision(proj, "Add sampleproject")
+    revisions.create_revision(proj, "Add sampleproject")
     return proj
 
 
 def writable_paths(venv: Path) -> tuple[Path, ...]:
-    """All files and directories of the venv with any write permission"""
+    """All files and directories of the venv with any write permission.
+
+    Without the lock file of uv, which stays writable in a protected venv.
+    """
     paths = (venv, *venv.rglob("*")) if venv.is_dir() else ()
     return tuple(
-        path for path in paths if not path.is_symlink() and path.lstat().st_mode & 0o222
+        path
+        for path in paths
+        if not path.is_symlink()
+        and path.lstat().st_mode & 0o222
+        and path != venv / constants.VENV_LOCK_FILE
     )
 
 
@@ -127,10 +135,10 @@ def synced_project(sample_project: UVRevProject) -> UVRevProject:
 @pytest.fixture
 def upgradeable_project(fake_basedir: Path, data_dir: Path) -> UVRevProject:
     """Create a project with an uv.lock that can be updated"""
-    proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV)
-    operations.create_env(fake_basedir, constants.DEFAULT_ENV)
+    proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV, Settings())
+    environment.create_env(fake_basedir, constants.DEFAULT_ENV, Settings())
     shutil.copytree(data_dir / "upgradeable", proj.project_path, dirs_exist_ok=True)
-    operations.create_revision(proj, "Add sampleproject")
+    revisions.create_revision(proj, "Add sampleproject")
     return proj
 
 

@@ -12,18 +12,18 @@ from conftest import Invoker, writable_paths
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-from uvrev import constants, operations
+from uvrev import constants, environment
 from uvrev.commands import git
 from uvrev.io import read_pyproject
-from uvrev.operations import show_history
 from uvrev.parser import parse_uv_lock_packages
-from uvrev.settings import PYTHON_VERSIONS_SUPPORTED_ENV
+from uvrev.revisions import show_history
+from uvrev.settings import Settings
 from uvrev.types import UVRevProject
 
 
 def create_fake_env(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    proj = UVRevProject(path)
+    proj = UVRevProject(path, Settings())
     proj.lock_path.touch()
     proj.pyproject_path.write_text("[tool.uv]\npackage = false\n")
 
@@ -60,7 +60,7 @@ def shared_project(shared_basedir: Path) -> UVRevProject:
     """
     Shared project for integration tests
     """
-    return UVRevProject(shared_basedir / constants.DEFAULT_ENV)
+    return UVRevProject(shared_basedir / constants.DEFAULT_ENV, Settings())
 
 
 @pytest.fixture(autouse=True)
@@ -189,7 +189,7 @@ class TestEnvCreate:
         result = invoke(*cmd)
         assert result.exit_code == 0
         target = shared_basedir / folder
-        proj = UVRevProject(target)
+        proj = UVRevProject(target, Settings())
         assert proj.exists()
 
         # Output tells the user what where exactly thing were created
@@ -235,7 +235,7 @@ class TestEnvCreateIdempotent:
 
     def test_create_again(self, invoke: Invoker, fake_basedir: Path) -> None:
         assert invoke("env", "create").exit_code == 0
-        proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV)
+        proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV, Settings())
         head = git("rev-parse", "HEAD", project=proj, capture_output=True)
 
         result = invoke("env", "create", "--python", "3.99")
@@ -245,11 +245,14 @@ class TestEnvCreateIdempotent:
         assert "already exists" in result.output
         assert git("rev-parse", "HEAD", project=proj, capture_output=True) == head
         # also the function itself is idempotent
-        assert operations.create_env(fake_basedir, constants.DEFAULT_ENV) == proj
+        assert (
+            environment.create_env(fake_basedir, constants.DEFAULT_ENV, Settings())
+            == proj
+        )
 
     def test_created_marker(self, invoke: Invoker, fake_basedir: Path) -> None:
         assert invoke("env", "create").exit_code == 0
-        proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV)
+        proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV, Settings())
 
         assert proj.created_marker_path.read_text().strip() == version("uvrev")
         # the marker is ignored by git
@@ -273,7 +276,7 @@ class TestEnvCreateIdempotent:
         result = invoke("env", "create", "--force")
         assert result.exit_code == 0, result.output
         assert not target.joinpath("leftover").exists()
-        assert UVRevProject(target).created_successfully()
+        assert UVRevProject(target, Settings()).created_successfully()
 
     def test_warning_and_fix(self, invoke: Invoker, fake_basedir: Path) -> None:
         target = fake_basedir / "old"
@@ -289,7 +292,7 @@ class TestEnvCreateIdempotent:
         result = invoke("env", "fix", "old")
         assert result.exit_code == 0
         assert "is not a git repository" in result.output
-        assert UVRevProject(target).created_successfully()
+        assert UVRevProject(target, Settings()).created_successfully()
         exclude = target / ".git" / "info" / "exclude"
         ignored = (
             f"{constants.CREATED_MARKER_FILE}\n{constants.UNPROTECTED_MARKER_FILE}\n"
@@ -322,7 +325,7 @@ class TestEnvironments:
     def test_created_with_installed(self, invoke: Invoker, fake_basedir: Path) -> None:
         """Without setting, the installed versions matching requires-python"""
         assert invoke("env", "create").exit_code == 0
-        proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV)
+        proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV, Settings())
         pinned = proj.python_version_path.read_text().strip()
 
         markers = self.environments(proj)
@@ -341,19 +344,19 @@ class TestEnvironments:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         assert invoke("env", "create").exit_code == 0
-        proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV)
+        proj = UVRevProject(fake_basedir / constants.DEFAULT_ENV, Settings())
         pinned = proj.python_version_path.read_text().strip()
 
         # no supported version (3.0 is below requires-python):
         # tool.uv.environments is removed
-        monkeypatch.setenv(PYTHON_VERSIONS_SUPPORTED_ENV, "3.0")
+        monkeypatch.setenv(constants.PYTHON_VERSIONS_SUPPORTED_ENV, "3.0")
         report = parse_report(invoke("upgrade", "--json"))
         assert report["revision"] == 1
         assert report["environments"]["new"] == []
         assert self.environments(proj) == []
 
         # versions below requires-python are not used
-        monkeypatch.setenv(PYTHON_VERSIONS_SUPPORTED_ENV, f"3.0, {pinned}")
+        monkeypatch.setenv(constants.PYTHON_VERSIONS_SUPPORTED_ENV, f"3.0, {pinned}")
         result = invoke("add", "peppercorn", "--json")
 
         assert result.exit_code == 0, result.output
@@ -361,7 +364,7 @@ class TestEnvironments:
         assert report["revision"] == 2
         assert report["environments"] == {
             "old": [],
-            "new": list(operations.environment_markers((pinned,))),
+            "new": list(environment.environment_markers((pinned,))),
         }
         assert self.environments(proj) == report["environments"]["new"]
         message = git("log", "-1", "--format=%B", project=proj, capture_output=True)
@@ -383,12 +386,12 @@ class TestEnvironments:
         upgradeable_project: UVRevProject,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setenv(PYTHON_VERSIONS_SUPPORTED_ENV, "3.12,abc")
+        monkeypatch.setenv(constants.PYTHON_VERSIONS_SUPPORTED_ENV, "3.12,abc")
 
         result = invoke("upgrade")
 
         assert result.exit_code == 1
-        assert PYTHON_VERSIONS_SUPPORTED_ENV in result.output
+        assert constants.PYTHON_VERSIONS_SUPPORTED_ENV in result.output
 
 
 class TestEnvList:

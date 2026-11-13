@@ -1,69 +1,32 @@
+"""Verify that a venv contains exactly what its packages installed, and fix it.
+
+A valid venv only contains the files in the ``RECORD`` of its packages (with
+the recorded hash), the files of the venv itself and bytecode of an existing
+source, and it is in sync with ``uv.lock``. Every file is hashed, so this does
+not depend on timestamps (the fast check by ctime is in ``repair.py``).
+"""
+
 import base64
 import csv
 import hashlib
 import os
-import re
 import subprocess
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from importlib.metadata import Distribution, distributions
 from pathlib import Path
-from types import MappingProxyType
-from typing import Final, Literal
+from typing import Literal
 
 from packaging.utils import NormalizedName, canonicalize_name
 
-from .commands import STDERR_FD, show_cmd, uv
+from . import constants
+from .commands import show_cmd, uv
+from .exceptions import SubprocessFailure
 from .marker import remove_marker
 from .protection import writable_venv
-from .types import SubprocessFailure, UVRevProject
+from .types import UVRevProject
 
 type ProblemKind = Literal["missing", "modified", "not_synced", "untracked"]
-
-# Problems fixed by reinstalling the package
-REINSTALL: Final[frozenset[ProblemKind]] = frozenset({"missing", "modified"})
-# Problems that are only reported. There is none anymore: a valid venv only
-# contains the files of its packages, so untracked files are removed.
-WARNINGS: Final[frozenset[ProblemKind]] = frozenset()
-
-# The files a venv consists of itself, they are not installed by a package and
-# can not be verified or restored (only by creating the venv again).
-# In the root of the venv:
-VENV_ROOT_FILES: Final[frozenset[str]] = frozenset(
-    {"pyvenv.cfg", ".gitignore", "CACHEDIR.TAG", ".lock"}
-)
-# next to the interpreter (bin or Scripts):
-VENV_SCRIPTS: Final[frozenset[str]] = frozenset(
-    {
-        "activate",
-        "activate.bat",
-        "activate.csh",
-        "activate.fish",
-        "activate.nu",
-        "activate.ps1",
-        "activate.xsh",
-        "activate_this.py",
-        "deactivate.bat",
-        "pydoc.bat",
-    }
-)
-VENV_INTERPRETER: Final[re.Pattern[str]] = re.compile(
-    r"(python|pypy)w?[0-9.]*t?(\.exe)?"
-)
-SCRIPT_DIRECTORIES: Final[frozenset[str]] = frozenset({"bin", "Scripts"})
-# in site-packages:
-VENV_SITE_FILES: Final[frozenset[str]] = frozenset(
-    {"_virtualenv.py", "_virtualenv.pth"}
-)
-
-DESCRIPTIONS: Final[Mapping[ProblemKind, str]] = MappingProxyType(
-    {
-        "missing": "missing",
-        "modified": "modified",
-        "not_synced": "not in sync with uv.lock",
-        "untracked": "not installed by any package",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -82,11 +45,7 @@ class Problem:
         b.py: not installed by any package
         """
         package = f" ({self.package})" if self.package else ""
-        return f"{self.path}{package}: {DESCRIPTIONS[self.kind]}"
-
-    @property
-    def is_warning(self) -> bool:
-        return self.kind in WARNINGS
+        return f"{self.path}{package}: {constants.PROBLEM_DESCRIPTIONS[self.kind]}"
 
 
 def file_hash(path: Path, algorithm: str) -> str:
@@ -137,9 +96,10 @@ def read_record(dist: Distribution) -> tuple[RecordEntry, ...]:
 
 
 def is_venv_file(project: UVRevProject, path: Path) -> bool:
-    """True for the files a venv consists of itself (see ``VENV_ROOT_FILES``).
+    """True for the files a venv consists of itself (see ``constants.VENV_ROOT_FILES``).
 
-    >>> project = UVRevProject(Path("/env"))
+    >>> from uvrev.settings import Settings
+    >>> project = UVRevProject(Path("/env"), Settings())
     >>> is_venv_file(project, Path("/env/.venv/pyvenv.cfg"))
     True
     >>> is_venv_file(project, Path("/env/.venv/bin/python3.14"))
@@ -153,11 +113,15 @@ def is_venv_file(project: UVRevProject, path: Path) -> bool:
     """
     parts = path.relative_to(project.venv_path.resolve()).parts
     if len(parts) == 1:
-        return parts[0] in VENV_ROOT_FILES
-    if len(parts) == 2 and parts[0] in SCRIPT_DIRECTORIES:  # noqa: PLR2004
+        return parts[0] in constants.VENV_ROOT_FILES
+    if len(parts) == 2 and parts[0] in constants.SCRIPT_DIRECTORIES:  # noqa: PLR2004
         name = parts[1]
-        return name in VENV_SCRIPTS or bool(VENV_INTERPRETER.fullmatch(name))
-    return path.name in VENV_SITE_FILES and path.parent in project.site_packages
+        return name in constants.VENV_SCRIPTS or bool(
+            constants.VENV_INTERPRETER.fullmatch(name)
+        )
+    return (
+        path.name in constants.VENV_SITE_FILES and path.parent in project.site_packages
+    )
 
 
 def bytecode_source(path: Path) -> Path | None:
@@ -182,14 +146,21 @@ def venv_files(project: UVRevProject) -> Iterator[Path]:
             yield Path(directory, name)
 
 
-def tracked_files(project: UVRevProject) -> Mapping[Path, NormalizedName]:
-    """The files installed by the packages (their RECORD) and their package"""
+def installed_records(
+    project: UVRevProject,
+) -> tuple[tuple[NormalizedName, RecordEntry], ...]:
+    """The RECORD entries of all installed packages, each with its package"""
     site_packages = [str(path) for path in project.site_packages]
-    return {
-        entry.path: canonicalize_name(dist.metadata["Name"])
+    return tuple(
+        (canonicalize_name(dist.metadata["Name"]), entry)
         for dist in distributions(path=site_packages)
         for entry in read_record(dist)
-    }
+    )
+
+
+def tracked_files(project: UVRevProject) -> Mapping[Path, NormalizedName]:
+    """The files installed by the packages (their RECORD) and their package"""
+    return {entry.path: package for package, entry in installed_records(project)}
 
 
 def is_untracked(
@@ -208,25 +179,23 @@ def is_untracked(
 
 def _check_records(project: UVRevProject) -> Iterator[Problem]:
     """Compare the files of all installed packages with their RECORD"""
-    site_packages = project.site_packages
-    for dist in distributions(path=[str(path) for path in site_packages]):
-        package = canonicalize_name(dist.metadata["Name"])
-        for entry in read_record(dist):
-            path = entry.path
-            if entry.algorithm is None or entry.hash is None:
-                # e.g. RECORD itself, nothing to compare
-                continue
-            try:
-                st = path.lstat()
-            except FileNotFoundError:
-                yield Problem("missing", path, package)
-                continue
-            if (entry.size is not None and st.st_size != entry.size) or (
-                file_hash(path, entry.algorithm) != entry.hash
-            ):
-                yield Problem("modified", path, package)
+    records = installed_records(project)
+    for package, entry in records:
+        path = entry.path
+        if entry.algorithm is None or entry.hash is None:
+            # e.g. RECORD itself, nothing to compare
+            continue
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            yield Problem("missing", path, package)
+            continue
+        if (entry.size is not None and st.st_size != entry.size) or (
+            file_hash(path, entry.algorithm) != entry.hash
+        ):
+            yield Problem("modified", path, package)
 
-    tracked = tracked_files(project)
+    tracked = {entry.path: package for package, entry in records}
     for path in venv_files(project):
         if is_untracked(project, path, tracked):
             yield Problem("untracked", path)
@@ -251,16 +220,9 @@ class VerifyResult:
     # True if fixing repaired at least one problem
     fixed: bool = False
 
-    @property
-    def errors(self) -> tuple[Problem, ...]:
-        """The remaining problems that are no warnings
 
-        >>> untracked = Problem("untracked", Path("a.py"))
-        >>> modified = Problem("modified", Path("b.py"))
-        >>> VerifyResult((untracked, modified), (modified,)).errors == (modified,)
-        True
-        """
-        return tuple(problem for problem in self.remaining if not problem.is_warning)
+# verify(project, fix) of a venv, so callers and tests can give another one
+type Verifier = Callable[[UVRevProject, bool], VerifyResult]
 
 
 def find_problems(project: UVRevProject) -> tuple[Problem, ...]:
@@ -293,7 +255,7 @@ def sync_bytecode(project: UVRevProject) -> tuple[Path, ...]:
         show_cmd(cmd)
         # files that can not be compiled (e.g. templates, code for another
         # Python version) are reported by compileall, but are no failure
-        subprocess.run(cmd, stdout=STDERR_FD, check=False)
+        subprocess.run(cmd, stdout=constants.STDERR_FD, check=False)
     return tuple(removed)
 
 
@@ -321,7 +283,7 @@ def fix_problems(
             {
                 problem.package
                 for problem in problems
-                if problem.kind in REINSTALL and problem.package
+                if problem.kind in constants.REINSTALL_PROBLEMS and problem.package
             }
         )
     )

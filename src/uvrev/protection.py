@@ -1,28 +1,24 @@
+"""Protect a venv against accidental changes by removing write permissions.
+
+``chmod`` makes the venv read-only or writable. A protected venv can still be
+used: only the lock file of uv stays writable, as uv needs it to read the venv. ``writable()`` is for the
+changes uvrev makes itself: writable within the block, protected afterwards.
+
+Unprotecting for a hotfix by the user, and repairing afterwards, is in
+``repair.py`` and ``marker.py``.
+"""
+
 import shutil
+import stat
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 
-import click
-
-from . import settings as uvrev_settings
+from . import constants
 from .commands import run_cmd
+from .exceptions import ChmodNotFoundError
 from .settings import Settings
 from .types import UVRevProject
-
-
-class ChmodNotFoundError(click.ClickException):
-    """Protection is enabled, but there is no chmod to change the permissions"""
-
-    def __init__(self, command: str) -> None:
-        super().__init__(
-            f"Protecting the .venv is enabled, but the '{command}' command was not "
-            "found. "
-            "It is needed to change the permissions of the .venv. "
-            "Install it, or disable the protection with 'protect = false' in the "
-            f"[uvrev] table of {uvrev_settings.config_file()} "
-            "or the environment variable UVREV_PROTECT=false."
-        )
 
 
 def chmod(venv: Path, mode: str, command: str) -> None:
@@ -37,13 +33,32 @@ def chmod(venv: Path, mode: str, command: str) -> None:
     if not venv.is_dir():
         return
     if shutil.which(command) is None:
-        raise ChmodNotFoundError(command)
+        raise ChmodNotFoundError(command, constants.config_file())
     run_cmd(command, "-R", mode, venv.name, cwd=venv.parent)
 
 
+def keep_lock_writable(venv: Path) -> None:
+    """Let the owner write the lock file of a protected venv.
+
+    uv locks a venv before it uses it, also to only read it
+    (``uv sync --check``), and opens ``.venv/.lock`` for writing to do so.
+    If it can not, uv goes on without the lock (it only warns with
+    ``--verbose``) and could read a venv that another uv is changing.
+    The file is empty and the folder stays read-only, so nothing else
+    can be changed.
+    """
+    lock = venv / constants.VENV_LOCK_FILE
+    if lock.is_file() and not lock.is_symlink():
+        lock.chmod(lock.stat().st_mode | stat.S_IWUSR)
+
+
 def protect_venv(venv: Path, settings: Settings) -> None:
-    """Remove write permissions, so the venv can not be changed by accident"""
+    """Remove write permissions, so the venv can not be changed by accident.
+
+    Only its lock file stays writable for the owner, see ``keep_lock_writable``.
+    """
     chmod(venv, settings.protect_mode, settings.chmod_command)
+    keep_lock_writable(venv)
 
 
 def unprotect_venv(venv: Path, settings: Settings) -> None:

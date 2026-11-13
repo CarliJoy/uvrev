@@ -1,41 +1,26 @@
+"""The JSON reports printed with ``--json`` and the data they are built from.
+
+The dataclasses define the schema (the field order is the order in the JSON),
+the README documents it. They only convert results into JSON compatible values:
+when a report is printed is decided in ``cli.py``.
+"""
+
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
-from typing import Final, Literal, Self
+from dataclasses import asdict, dataclass, replace
+from typing import Literal, Self, TypedDict
 
-from packaging.specifiers import SpecifierSet
-from packaging.utils import NormalizedName, canonicalize_name
-from packaging.version import Version
+from packaging.utils import NormalizedName
 
+from . import constants
 from .differ import Changes, Diff, Names, VersionChange
 from .repair import RepairResult
+from .revisions import RevisionChange
 from .types import Revision
 from .verify import Problem, VerifyResult
 
-SCHEMA_VERSION: Final[int] = 2
-
 # value of a command line option in the report
 type Option = bool | str | None
-
-
-@dataclass(frozen=True)
-class RevisionChange:
-    """Outcome of a command that may change an environment"""
-
-    previous_revision: Revision
-    revision: Revision
-    packages: Diff[Version] = field(default_factory=Diff)
-    dependencies: Diff[SpecifierSet | None] = field(default_factory=Diff)
-    # exact version of the interpreter
-    python: Diff[Version] = field(default_factory=Diff)
-    environments: Diff[None] = field(default_factory=Diff)
-    # pinned Python request (.python-version)
-    python_request: Diff[str] = field(default_factory=Diff)
-
-    @property
-    def created(self) -> bool:
-        """True if a new revision was created"""
-        return self.revision != self.previous_revision
 
 
 @dataclass(frozen=True)
@@ -74,7 +59,9 @@ class ProblemEntry:
     kind: str
     path: str
     package: str | None
-    is_warning: bool
+    # always False: kept for the consumers of the report, there are no
+    # problems anymore that are only reported
+    is_warning: bool = False
 
     @classmethod
     def from_problem(cls, problem: Problem) -> Self:
@@ -82,7 +69,6 @@ class ProblemEntry:
             kind=problem.kind,
             path=str(problem.path),
             package=problem.package,
-            is_warning=problem.is_warning,
         )
 
 
@@ -91,7 +77,7 @@ class VerifySummary:
     """Result of verifying a venv, as shown in the reports
 
     >>> from pathlib import Path
-    >>> problem = Problem("modified", Path("a.py"), canonicalize_name("pkg"))
+    >>> problem = Problem("modified", Path("a.py"), NormalizedName("pkg"))
     >>> summary = VerifySummary.from_result(VerifyResult((problem,), (), fixed=True))
     >>> summary.problems
     (ProblemEntry(kind='modified', path='a.py', package='pkg', is_warning=False),)
@@ -120,7 +106,7 @@ class RepairSummary:
     """Repair of an unprotected environment, as shown in the reports
 
     >>> from pathlib import Path
-    >>> result = RepairResult("fast", (canonicalize_name("six"),), (Path("x.py"),))
+    >>> result = RepairResult("fast", (NormalizedName("six"),), (Path("x.py"),))
     >>> RepairSummary.from_result(result)
     RepairSummary(mode='fast', packages=('six',), removed_files=('x.py',))
     >>> RepairSummary.from_result(None) is None
@@ -145,15 +131,38 @@ class RepairSummary:
         )
 
 
-@dataclass(frozen=True)
-class Report:
-    """JSON report of a command, the field order is the order in the JSON"""
+class Header(TypedDict):
+    """The fields all reports start with, as arguments for a ``CommandReport``"""
 
     schema_version: int
     status: Literal["success", "error"]
     command: str
     arguments: tuple[str, ...]
     options: Mapping[str, Option]
+
+
+@dataclass(frozen=True)
+class CommandReport:
+    """JSON report of a command, the field order is the order in the JSON.
+
+    The subclasses add the fields of their command, ``error_message`` is last.
+    """
+
+    schema_version: int
+    status: Literal["success", "error"]
+    command: str
+    arguments: tuple[str, ...]
+    options: Mapping[str, Option]
+
+    def to_json(self) -> str:
+        """Serialize the report, tuples become JSON arrays."""
+        return json.dumps(asdict(self), indent=2)
+
+
+@dataclass(frozen=True)
+class Report(CommandReport):
+    """The change report: JSON report of a command that changes an environment"""
+
     revision: Revision | None
     previous_revision: Revision | None
     changes: Changes
@@ -197,6 +206,7 @@ class Report:
                 could not be fixed), marks the report as failed.
 
         Examples:
+            >>> from packaging.version import Version
             >>> change = RevisionChange(
             ...     Revision(1),
             ...     Revision(2),
@@ -225,7 +235,7 @@ class Report:
             ('error', 2, False)
         """
         return cls(
-            schema_version=SCHEMA_VERSION,
+            schema_version=constants.SCHEMA_VERSION,
             status="error" if error_message else "success",
             command=command,
             arguments=arguments,
@@ -240,10 +250,8 @@ class Report:
                 packages=change.packages.versions(),
                 dependencies=change.dependencies.versions(),
             ),
-            python=change.python.versions().get(canonicalize_name("python")),
-            python_request=change.python_request.versions().get(
-                canonicalize_name("python")
-            ),
+            python=change.python.versions().get(constants.PYTHON_NAME),
+            python_request=change.python_request.versions().get(constants.PYTHON_NAME),
             environments=EnvironmentsChange.from_diff(change.environments),
             repair=RepairSummary.from_result(repair),
             verify=VerifySummary.from_result(verify) if verify else None,
@@ -276,86 +284,49 @@ class Report:
             ('boom', ())
             >>> Report.from_error("sync", (), None, "boom").revision is None
             True
+
+            The complete report:
+
+            >>> print(Report.from_error("sync", (), None, "boom").to_json())
+            {
+              "schema_version": 2,
+              "status": "error",
+              "command": "sync",
+              "arguments": [],
+              "options": {},
+              "revision": null,
+              "previous_revision": null,
+              "changes": {
+                "added": [],
+                "updated": [],
+                "downgraded": [],
+                "removed": []
+              },
+              "all_changed_packages": [],
+              "dependency_changes": {
+                "added": [],
+                "updated": [],
+                "downgraded": [],
+                "removed": []
+              },
+              "all_changed_dependencies": [],
+              "versions": {
+                "packages": {},
+                "dependencies": {}
+              },
+              "python": null,
+              "python_request": null,
+              "environments": null,
+              "repair": null,
+              "verify": null,
+              "error_message": "boom"
+            }
         """
-        no_changes = Diff[Version]()
-        return cls(
-            schema_version=SCHEMA_VERSION,
-            status="error",
-            command=command,
-            arguments=arguments,
-            options=dict(options or {}),
-            revision=revision,
-            previous_revision=revision,
-            changes=no_changes.changes(),
-            all_changed_packages=(),
-            dependency_changes=no_changes.changes(),
-            all_changed_dependencies=(),
-            versions=Versions(packages={}, dependencies={}),
-            python=None,
-            python_request=None,
-            environments=None,
-            repair=None,
-            verify=None,
-            error_message=error_message,
+        unchanged = RevisionChange(Revision(0), Revision(0))
+        report = cls.from_change(
+            command, arguments, unchanged, options, error_message=error_message
         )
-
-    def to_json(self) -> str:
-        """Serialize the report, tuples become JSON arrays.
-
-        >>> print(Report.from_error("sync", (), None, "boom").to_json())
-        {
-          "schema_version": 2,
-          "status": "error",
-          "command": "sync",
-          "arguments": [],
-          "options": {},
-          "revision": null,
-          "previous_revision": null,
-          "changes": {
-            "added": [],
-            "updated": [],
-            "downgraded": [],
-            "removed": []
-          },
-          "all_changed_packages": [],
-          "dependency_changes": {
-            "added": [],
-            "updated": [],
-            "downgraded": [],
-            "removed": []
-          },
-          "all_changed_dependencies": [],
-          "versions": {
-            "packages": {},
-            "dependencies": {}
-          },
-          "python": null,
-          "python_request": null,
-          "environments": null,
-          "repair": null,
-          "verify": null,
-          "error_message": "boom"
-        }
-        """
-        return json.dumps(asdict(self), indent=2)
-
-
-@dataclass(frozen=True)
-class CommandReport:
-    """Common fields of the JSON reports that are no change reports.
-
-    The subclasses add the fields of their command, ``error_message`` is last.
-    """
-
-    schema_version: int
-    status: Literal["success", "error"]
-    command: str
-    arguments: tuple[str, ...]
-    options: Mapping[str, Option]
-
-    def to_json(self) -> str:
-        """Serialize the report, tuples become JSON arrays."""
-        return json.dumps(asdict(self), indent=2)
+        return replace(report, revision=revision, previous_revision=revision)
 
 
 @dataclass(frozen=True)

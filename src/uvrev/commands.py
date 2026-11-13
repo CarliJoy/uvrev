@@ -1,3 +1,10 @@
+"""Run the external commands uvrev is built on: ``uv``, ``git`` and others.
+
+The commands are shown before they run, their stdout goes to stderr (so
+uvrev's stdout stays parseable) and a failure becomes a ``SubprocessFailure``.
+What the commands are used for is decided by the callers.
+"""
+
 import os
 import shlex
 import shutil
@@ -6,14 +13,13 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from functools import cache
 from pathlib import Path
-from typing import Literal, Protocol, overload
+from typing import Protocol
 
 import click
 
-from uvrev.types import SubprocessFailure, UVRevProject
-
-# stdout of internal commands is redirected here, so uvrev's stdout stays parseable
-STDERR_FD = 2
+from . import constants
+from .exceptions import CommandNotFoundError, SubprocessFailure
+from .types import UVRevProject
 
 
 def show_cmd(cmd: tuple[str, ...]) -> None:
@@ -23,17 +29,6 @@ def show_cmd(cmd: tuple[str, ...]) -> None:
         + click.style(shlex.join(cmd), fg="magenta"),
         err=True,
     )
-
-
-class CommandNotFoundError(click.ClickException):
-    """A command uvrev needs (uv, git) is not installed"""
-
-    def __init__(self, command: str) -> None:
-        self.command = command
-        super().__init__(
-            f"The '{command}' command was not found. "
-            f"uvrev needs {command}, install it and make sure it is on the PATH."
-        )
 
 
 @contextmanager
@@ -62,6 +57,40 @@ def show_cwd_change(project_path: Path) -> None:
     show_cmd(("cd", str(project_path)))
 
 
+def run_in(
+    cwd: Path,
+    cmd: tuple[str, ...],
+    env: Mapping[str, str] | None = None,
+    stdout: int | None = constants.STDERR_FD,
+) -> str:
+    """Show a command and run it in a directory.
+
+    Args:
+        cwd: Directory to run the command in.
+        cmd: Command and its arguments.
+        env: Environment of the command, None for the one of uvrev.
+        stdout: Where stdout of the command goes: to stderr by default,
+            ``subprocess.PIPE`` to capture it, None to keep it on stdout.
+
+    Returns:
+        The captured stdout, otherwise an empty string.
+
+    Raises:
+        SubprocessFailure: If the command fails.
+        CommandNotFoundError: If the command is not installed.
+    """
+    show_cwd_change(cwd)
+    show_cmd(cmd)
+    try:
+        with needs_command(cmd[0], os.environ if env is None else env):
+            result = subprocess.run(
+                cmd, cwd=cwd, env=env, stdout=stdout, text=True, check=True
+            )
+    except subprocess.CalledProcessError as e:
+        raise SubprocessFailure(e) from e
+    return result.stdout or ""
+
+
 def run_cmd(*cmd: str, cwd: Path) -> None:
     """
     Execute a command in a directory, its stdout goes to stderr
@@ -70,34 +99,10 @@ def run_cmd(*cmd: str, cwd: Path) -> None:
         *cmd: Command and its arguments
         cwd: Directory to run command in
     """
-    show_cwd_change(cwd)
-    show_cmd(cmd)
-    try:
-        with needs_command(cmd[0], os.environ):
-            subprocess.run(cmd, cwd=cwd, stdout=STDERR_FD, check=True)
-    except subprocess.CalledProcessError as e:
-        raise SubprocessFailure(e) from e
+    run_in(cwd, cmd)
 
 
-@overload
-def git(
-    *args: str,
-    project: UVRevProject,
-    capture_output: Literal[False] = False,
-) -> None: ...
-
-
-@overload
-def git(
-    *args: str,
-    project: UVRevProject,
-    capture_output: Literal[True],
-) -> str: ...
-def git(
-    *args: str,
-    project: UVRevProject,
-    capture_output: bool = False,
-) -> str | None:
+def git(*args: str, project: UVRevProject, capture_output: bool = False) -> str:
     """
     Execute git command in project directory
 
@@ -107,34 +112,18 @@ def git(
         capture_output: If True, capture and return stdout
 
     Returns:
-        Command stdout if capture_output=True, empty string otherwise
+        Command stdout if capture_output=True, otherwise an empty string
     """
-    show_cwd_change(project.project_path)
-    cmd = ("git", *args)
-    show_cmd(cmd)
-
-    stdout = subprocess.PIPE if capture_output else STDERR_FD
-    try:
-        with needs_command("git", os.environ):
-            result = subprocess.run(
-                cmd,
-                cwd=project.project_path,
-                stdout=stdout,
-                text=True,
-                check=True,
-            )
-    except subprocess.CalledProcessError as e:
-        raise SubprocessFailure(e) from e
-    if capture_output:
-        return result.stdout
-    return None
+    stdout = subprocess.PIPE if capture_output else constants.STDERR_FD
+    return run_in(project.project_path, ("git", *args), stdout=stdout)
 
 
 def uv_environ(project: UVRevProject, environ: Mapping[str, str]) -> dict[str, str]:
     """Environment variables for uv commands of a project
 
+    >>> from uvrev.settings import Settings
     >>> env = uv_environ(
-    ...     UVRevProject(Path("/project")),
+    ...     UVRevProject(Path("/project"), Settings()),
     ...     {"VIRTUAL_ENV": "/home/user/.venv", "UV_PYTHON": "3.8", "KEEP_ME": "IN"},
     ... )
     >>> sorted(env.items())
@@ -166,28 +155,13 @@ def uv(
     Returns:
         Command stdout if capture_output=True, otherwise an empty string
     """
-    show_cwd_change(project.project_path)
-    cmd = ("uv", *args)
-    show_cmd(cmd)
-    env = uv_environ(project, os.environ)
-    stdout: int | None = STDERR_FD
+    stdout: int | None = constants.STDERR_FD
     if capture_output:
         stdout = subprocess.PIPE
     elif keep_stdout:
         stdout = None
-    try:
-        with needs_command("uv", env):
-            result = subprocess.run(
-                cmd,
-                cwd=project.project_path,
-                check=True,
-                env=env,
-                stdout=stdout,
-                text=True,
-            )
-    except subprocess.CalledProcessError as e:
-        raise SubprocessFailure(e) from e
-    return result.stdout if capture_output else ""
+    env = uv_environ(project, os.environ)
+    return run_in(project.project_path, ("uv", *args), env, stdout)
 
 
 class UvRunner(Protocol):
@@ -229,7 +203,7 @@ def uv_tool(
     """
     cmd = ("uv", *args)
     show_cmd(cmd)
-    stdout: int = STDERR_FD
+    stdout: int = constants.STDERR_FD
     if capture_stdout:
         stdout = subprocess.PIPE
     stderr: int | None = None

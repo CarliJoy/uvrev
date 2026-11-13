@@ -8,8 +8,9 @@ import pytest
 from click.testing import Result
 from conftest import Invoker, permissions
 
-from uvrev import operations
+from uvrev import operations, revisions
 from uvrev.commands import git
+from uvrev.interpreter import preview_python
 from uvrev.types import UVRevProject
 
 NO_CHANGES: dict[str, list[str]] = {
@@ -26,7 +27,7 @@ def snapshot(project: UVRevProject) -> dict[str, Any]:
         "head": git("rev-parse", "HEAD", project=project, capture_output=True),
         "tags": git("tag", "--list", project=project, capture_output=True),
         "status": git("status", "--porcelain", project=project, capture_output=True),
-        "files": operations.current_state(project),
+        "files": revisions.current_state(project),
         "installed": operations.list_venv_packages(project),
         "permissions": permissions(project.venv_path),
         "entries": sorted(path.name for path in project.project_path.iterdir()),
@@ -119,7 +120,7 @@ class TestAdd:
         assert data["changes"] == {**NO_CHANGES, "added": ["six"]}
         assert data["dependency_changes"] == {**NO_CHANGES, "added": ["six"]}
         assert data["versions"]["dependencies"] == {"six": {"old": None, "new": ""}}
-        assert "uv add --raw --no-sync 'six>=0'" in result.stderr
+        assert "uv add --no-sync --raw 'six>=0'" in result.stderr
         assert "Created revision" not in result.stderr
         assert snapshot(project) == before
 
@@ -131,7 +132,7 @@ class TestAdd:
         data = report(result)
         assert data["changes"]["added"] == ["six"]
         assert data["changes"]["updated"] == ["peppercorn", "sampleproject"]
-        assert "uv add --raw --no-sync --upgrade 'six>=0'" in result.stderr
+        assert "uv add --no-sync --raw --upgrade 'six>=0'" in result.stderr
         assert "uv lock --upgrade" in result.stderr
         assert snapshot(project) == before
 
@@ -194,6 +195,46 @@ class TestRemove:
         assert "uv remove" not in result.stderr
 
 
+class TestRestore:
+    def test_restore(self, invoke: Invoker, project: UVRevProject) -> None:
+        before = snapshot(project)
+
+        result = invoke("restore", "0", "--dry-run", "--json")
+
+        data = report(result)
+        assert data["arguments"] == ["0"]
+        assert data["options"] == {"dry_run": True}
+        assert data["changes"]["removed"] == ["peppercorn", "sampleproject"]
+        assert data["dependency_changes"]["removed"] == ["sampleproject"]
+        # uv.lock of the revision is only checked, nothing is installed
+        assert "uv lock --check" in result.stderr
+        assert "uv sync" not in result.stderr
+        assert "Restored" not in result.stderr
+        assert snapshot(project) == before
+
+    def test_outdated_lock(self, invoke: Invoker, project: UVRevProject) -> None:
+        """The dry run fails like the restore: uv.lock of the test data is outdated"""
+        before = snapshot(project)
+
+        result = invoke("restore", "1", "--dry-run", "--json")
+
+        assert result.exit_code == 1
+        assert json.loads(result.stdout)["status"] == "error"
+        assert "uv lock --check" in result.stderr
+        assert snapshot(project) == before
+
+    def test_unknown_revision(self, invoke: Invoker, project: UVRevProject) -> None:
+        before = snapshot(project)
+
+        result = invoke("restore", "99", "--dry-run", "--json")
+
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["status"] == "error"
+        assert data["error_message"] == "Revision 99 does not exist"
+        assert snapshot(project) == before
+
+
 class TestUpgradePython:
     def test_same_version(self, invoke: Invoker, project: UVRevProject) -> None:
         before = snapshot(project)
@@ -217,7 +258,7 @@ class TestUpgradePython:
             scratch.python_version_path.write_text(f"{exact}\n")
             project.python_lock_path.write_text("3.0.0\n")
 
-            change = operations.preview_change(project, scratch)
+            change = revisions.preview_change(project, scratch)
 
         assert not change.created
         assert {name: str(v) for name, v in change.python.new.items()} == {
@@ -230,7 +271,7 @@ class TestUpgradePython:
         with operations.scratch_copy(project) as scratch:
             scratch.python_version_path.write_text("3.99\n")
 
-            assert operations.preview_python(project, scratch) == recorded
+            assert preview_python(project, scratch) == recorded
 
     def test_no_recorded_version(self, project: UVRevProject, tmp_path: Path) -> None:
         """Environments of old versions have no recorded interpreter version"""
@@ -239,4 +280,4 @@ class TestUpgradePython:
         with operations.scratch_copy(project) as scratch:
             # missing files are not copied
             assert not scratch.python_version_path.exists()
-            assert operations.preview_python(project, scratch) == ""
+            assert preview_python(project, scratch) == ""

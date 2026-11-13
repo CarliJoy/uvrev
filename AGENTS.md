@@ -46,10 +46,13 @@ project folder. Environments are uv projects with `[tool.uv] package = false`.
   signatures and stored state. Mutate only local, short-lived objects.
 - Match the surrounding code: docstrings with Args/Returns/Examples, doctests
   for small pure functions.
+- Every module starts with a docstring that defines its scope: what belongs
+  in it and where related things are instead. A module that outgrows its
+  docstring is split.
 - stdout is reserved for results (e.g. the `--json` report). Logs, executed
   commands and the output of `uv`, `git` and `chmod` go to stderr.
   Only `uvrev run` and the tools of `uvrev tool run` write to stdout.
-- JSON reports (`--json`): all commands are `ReportingCommand`s (`cli.py`), which
+- JSON reports (`--json`): all commands are `ReportingCommand`s (`reporting.py`), which
   print a report for every failure. A command with `--json` gives it an
   `error_report` builder and the `report_options` shown as `options`.
   Never raise for a failure after printing a success report.
@@ -58,11 +61,34 @@ project folder. Environments are uv projects with `[tool.uv] package = false`.
 - Errors found while parsing options (unknown `--env`, invalid settings) are
   stored in `ctx.meta` and raised when the command is invoked, so they are
   reported as well. Usage errors (exit code 2) print no report.
-- A command that changes the files of an environment goes through
-  `apply_change()` in `operations.py`, which also gives it `--dry-run`
-  (the change runs in a scratch copy with `--no-sync` / `uv lock`).
-- Import cycle to keep in mind: `types` imports `settings`, `commands` imports
-  `types`. So `settings` must not import `commands`.
+- A command that changes the files of an environment is planned as data:
+  a pure `plan_*()` function in `operations.py` returns a `Change` (the uv
+  calls, the message of the revision), `apply_change()` runs it and returns
+  an `Outcome`. This also gives the command `--dry-run`: the change runs in a
+  scratch copy, translated by `dry_run_call()` (`--no-sync`, `uv lock`).
+  The cli shows the `Outcome` with `report_outcome()`.
+  `sync` does not change the files, so `sync_packages()` is its own function.
+- All constants live in `constants.py`, also if only one module uses them.
+  A value that depends on the environment at the time of the call is a
+  function there (`config_file()`: the tests change `XDG_CONFIG_HOME`).
+- `constants.py` and `exceptions.py` import nothing of uvrev and must stay
+  that way (`tests/test_layers.py`). An exception gets what it needs as an
+  argument, or imports late within a method (`terminal` in `UvrevError.show`).
+  `types.py` only imports `constants` (`Settings` only for type checkers).
+  The same test checks this.
+- `UVRevProject.settings` has no default: a project always gets the loaded
+  settings (`get_settings(ctx)`, `named_project()` in `options.py`), so no
+  caller has to know whether a function uses them. Only the report of a
+  failure may fall back to the defaults (`get_settings_or_defaults()`), as
+  the failure can be that the settings are invalid.
+- Import cycle to keep in mind: `report` imports `revisions`, `operations`
+  imports both. So `revisions` must not import `report`, and `report` must
+  not import `operations`.
+- The modules from bottom to top: `constants`, `exceptions`, `types`,
+  `settings`, `terminal`, `commands`, then the domain (`parser`, `differ`,
+  `io`, `marker`, `protection`, `verify`, `repair`, `interpreter`, `revisions`,
+  `environment`, `operations`, `tool`), then `report`, `reporting`,
+  `options` and `cli`.
 
 ## Testing
 
@@ -70,7 +96,7 @@ project folder. Environments are uv projects with `[tool.uv] package = false`.
   globals has hidden side effects. Make dependencies explicit instead:
   - small functions take the dependency as a parameter, defaulting to the
     real implementation (e.g. `uv: UvRunner = uv_tool`),
-  - bigger flows take a frozen service object: `Services` in `cli.py`
+  - bigger flows take a frozen service object: `Services` in `reporting.py`
     (settings, verify, tool services) and `ToolServices` in `tool.py`
     (uv runner, download, build, lock). Tests pass their own, e.g.
     `CliRunner().invoke(cli, args, obj=Services(...))`,
@@ -116,6 +142,13 @@ project folder. Environments are uv projects with `[tool.uv] package = false`.
   are settings). GNU `chmod -R` does not follow symlinks found while traversing,
   so the python interpreter `.venv/bin/python` links to is safe. Through the
   hardlinks, the files in the uv cache get the same permissions.
+- A protected `.venv` must stay usable. uv locks a venv with `.venv/.lock`
+  before it uses it, also to only read it (`uv sync --check`), and opens the
+  file for writing. If it can not, uv goes on without the lock and only warns
+  with `--verbose`. So `protect_venv()` keeps this one file writable for the
+  owner. `uv run --no-sync`, `uv tree`, `uv pip list` and `uv export` need no
+  write access. To check such things, run as a normal user under `strace`
+  and look for `EACCES`.
 - Every uv call that changes a `.venv` runs inside `writable_venv()` (tool
   venvs: `writable()`), which always protects again in `finally`. Nest it
   inside `reset_on_failure`. A protected `.venv` must be made writable before
@@ -161,11 +194,11 @@ project folder. Environments are uv projects with `[tool.uv] package = false`.
 - Python: `.python-version` holds a *request* (everything `uv python pin`
   accepts: version, range, implementation, path), never parse it as a version.
   Compare interpreters with `get_python_version()`. `add --python`,
-  `upgrade --python` and `upgrade-python` share the pin step in `apply_change()`
+  `upgrade --python` and `upgrade-python` share the pin step in `run_steps()`
   (pin first, then the command's uv call). `env create` pins the request too.
 - uv runs in the folder of the environment (a dry run in a temporary copy), not
   in the working directory of the user: paths given by the user must be made
-  absolute first (`absolute_python_request()`, a click callback in `cli.py`).
+  absolute first (`absolute_python_request()`, a click callback in `options.py`).
   `uv python pin` accepts a wrong path, only the following uv command fails.
 - `uv add` keeps the locked versions of other packages; with `--upgrade-all`
   use `uv add --upgrade`, then `uv sync --upgrade`.

@@ -11,10 +11,10 @@ import pytest
 from conftest import Invoker, writable_paths
 
 from uvrev.commands import git
+from uvrev.exceptions import VenvChangedError
 from uvrev.marker import Marker, read_marker, write_marker
 from uvrev.protection import protect, unprotect, writable_venv
 from uvrev.repair import (
-    VenvChangedError,
     changed_since,
     mark_unprotected,
     repair,
@@ -502,7 +502,7 @@ class TestCli:
 
         result = verify(unprotected, fix=True, find=unfixable)
 
-        assert result.errors
+        assert result.remaining
         assert marker(unprotected) == mark
 
     def test_verify_keeps_mark(self, invoke: Invoker, project: UVRevProject) -> None:

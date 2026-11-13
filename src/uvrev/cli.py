@@ -1,437 +1,71 @@
+"""The command line interface: the click commands.
+
+Every command parses its options, calls the functions of the other modules and
+shows the result: messages on stderr, the JSON report (``--json``) on stdout.
+
+Nothing here changes an environment itself, that is done by ``operations.py``,
+``environment.py``, ``repair.py``, ``verify.py`` and ``tool.py``. The shared
+options are in ``options.py``, how commands report in ``reporting.py``.
+"""
+
 import json
-import os
 import sys
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, NoReturn, Protocol
 
 import click
-from platformdirs import user_data_path
-from typed_settings.exceptions import TsError
 
-from uvrev.exceptions import RevisionNotFoundError, ToolError
-
-from . import constants, settings as uvrev_settings
+from . import constants
 from .commands import uv
+from .environment import configure_git, create_env, list_projects, mark_created
+from .exceptions import SubprocessFailure
+from .interpreter import get_python_version, python_request
 from .marker import read_marker
 from .operations import (
-    add_packages,
-    changelog_of,
-    configure_git,
-    create_env,
-    get_last_revision_number,
-    get_python_version,
+    apply_change,
     list_installed_packages,
-    list_projects,
-    mark_created,
-    python_request,
-    remove_packages,
-    restore_revision,
-    show_history,
+    plan_add,
+    plan_remove,
+    plan_restore,
+    plan_upgrade,
+    plan_upgrade_python,
+    split_missing,
     sync_packages,
-    upgrade_packages,
-    upgrade_python,
 )
-from .parser import absolute_python_request, same_python_request
+from .options import (
+    dry_run_option,
+    env_option,
+    get_base_dir,
+    json_option,
+    named_project,
+    python_request_callback,
+    verify_option,
+)
+from .parser import same_python_request
 from .protection import protect as protect_venv, writable_venv
 from .repair import RepairResult, mark_unprotected, repair
 from .report import (
-    SCHEMA_VERSION,
     EnvCreateReport,
-    Option,
     ProtectReport,
     RepairSummary,
-    Report,
-    RevisionChange,
     VerifyReport,
     VerifySummary,
 )
-from .settings import Settings, load_settings
+from .reporting import (
+    UvrevGroup,
+    change_error_report,
+    echo_problems,
+    get_services,
+    get_settings,
+    get_settings_or_defaults,
+    not_fixed,
+    report_header,
+    report_outcome,
+    verifier,
+)
+from .revisions import show_history
 from .terminal import fatal_error, success, warning
-from .tool import ToolServices, run_tool
-from .types import Revision, SubprocessFailure, UVRevProject
-from .verify import Problem, VerifyResult, verify
-
-
-def get_base_dir() -> Path:
-    """Get the base directory for uvrev projects.
-
-    Returns:
-        Path UVREV_BASE or user data path for uvrev
-    """
-    if custom_base := os.getenv("UVREV_BASE"):
-        base = Path(custom_base)
-    else:
-        base = user_data_path("uvrev")
-    base.mkdir(parents=True, exist_ok=True)
-    return base
-
-
-INCOMPLETE_HINT = " (not created successfully, run 'uvrev env fix {name}' if it works)"
-
-
-def warn_if_incomplete(project: UVRevProject) -> None:
-    """Warn if the environment was not created successfully"""
-    if not project.created_successfully():
-        warning(
-            f"Environment {project.project_path} was not created successfully"
-            f" (missing {constants.CREATED_MARKER_FILE})."
-            f" Run 'uvrev env fix {project.project_path.name}' if it works."
-        )
-
-
-type Verifier = Callable[[UVRevProject, bool], VerifyResult]
-
-
-@dataclass(frozen=True)
-class Services:
-    """State and services of a cli call
-
-    Created by the cli group, unless given as ``obj`` (e.g. by tests).
-    """
-
-    settings: Settings
-    # verify(project, fix) of the venv
-    verify: Verifier = verify
-    # services of uvrev tool run
-    tool: ToolServices = field(default_factory=ToolServices)
-
-
-def get_services(ctx: click.Context | None) -> Services:
-    """Services of the cli call.
-
-    Created when needed first (unless given as ``obj``), so a command that
-    fails to load the settings can report it like any other failure.
-    """
-    root = ctx.find_root() if ctx else None
-    if root is not None and isinstance(root.obj, Services):
-        return root.obj
-    services = Services(load_valid_settings())
-    if root is not None:
-        root.obj = services
-    return services
-
-
-def get_settings(ctx: click.Context | None) -> Settings:
-    """Settings loaded by the cli group, or loaded now if there is no context"""
-    return get_services(ctx).settings
-
-
-def load_valid_settings() -> Settings:
-    """Load the settings.
-
-    Raises:
-        click.ClickException: With a readable message, if they are invalid.
-    """
-    try:
-        return load_settings()
-    except TsError as e:
-        details = "".join(f"\n  {sub}" for sub in getattr(e, "exceptions", ()))
-        raise click.ClickException(f"Invalid settings: {e}{details}") from None
-
-
-class JsonReport(Protocol):
-    """A report printed with --json"""
-
-    def to_json(self) -> str: ...
-
-
-# builds the report of a failed command from its context and the error message
-type ErrorReporter = Callable[[click.Context, str], JsonReport]
-
-# key in click.Context.meta: error found while parsing the options, raised when
-# the command is invoked, so it is reported like the failures of the command
-DEFERRED_ERROR = "uvrev.deferred_error"
-
-# failures with a message for the user, everything else is a bug
-KNOWN_ERRORS = (click.ClickException, RevisionNotFoundError, FileExistsError)
-
-
-class ReportingCommand(click.Command):
-    """Command that reports every failure.
-
-    With --json a report with status "error" is printed to stdout for every
-    failure after the arguments were parsed and the exit code is 1.
-    Wrong usage of the command line (exit code 2) prints no report.
-
-    Args:
-        error_report: Builds the report of a failure, for commands with --json.
-        report_options: Names of the parameters shown as ``options`` in the report.
-    """
-
-    def __init__(
-        self,
-        *args: Any,
-        error_report: ErrorReporter | None = None,
-        report_options: tuple[str, ...] = (),
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self.error_report = error_report
-        self.report_options = report_options
-
-    def invoke(self, ctx: click.Context) -> Any:
-        try:
-            return self.invoke_command(ctx)
-        except KNOWN_ERRORS as e:
-            self.fail(ctx, e)
-        except Exception as e:
-            # a bug: still report it, the traceback is shown as usual
-            self.echo_error_report(ctx, f"{type(e).__name__}: {e}")
-            raise
-
-    def invoke_command(self, ctx: click.Context) -> Any:
-        """Run the command, unless parsing its options found an error"""
-        if deferred := ctx.meta.pop(DEFERRED_ERROR, None):
-            raise deferred
-        # invalid settings stop every command, also those not using them
-        get_services(ctx)
-        return super().invoke(ctx)
-
-    def echo_error_report(self, ctx: click.Context, message: str) -> bool:
-        """Print the report of a failure, if --json was given.
-
-        Returns:
-            True if the report was printed.
-        """
-        if not ctx.params.get("as_json") or self.error_report is None:
-            return False
-        click.echo(self.error_report(ctx, message).to_json())
-        return True
-
-    def fail(self, ctx: click.Context, e: Exception) -> NoReturn:
-        if isinstance(e, click.ClickException):
-            message = e.format_message()
-            if not self.echo_error_report(ctx, message):
-                # shown by click, with the exit code of the exception
-                raise e
-        else:
-            message = str(e)
-            self.echo_error_report(ctx, message)
-        fatal_error(message)
-
-
-class UvrevGroup(click.Group):
-    """Group whose commands and subgroups report every failure"""
-
-    command_class = ReportingCommand
-    group_class = type
-
-
-def report_arguments(ctx: click.Context) -> tuple[str, ...]:
-    """The arguments (not options) given to the command, for the report"""
-    values: list[str] = []
-    for param in ctx.command.params:
-        if not isinstance(param, click.Argument) or param.name is None:
-            continue
-        value = ctx.params.get(param.name)
-        if isinstance(value, tuple):
-            values.extend(str(item) for item in value)
-        elif value is not None:
-            values.append(str(value))
-    return tuple(values)
-
-
-def report_options(ctx: click.Context) -> Mapping[str, Option]:
-    """The options of the command shown in the report"""
-    names = getattr(ctx.command, "report_options", ())
-    return {name: ctx.params.get(name) for name in names}
-
-
-def report_command(ctx: click.Context) -> str:
-    """Name of the command in the report, e.g. ``add`` or ``env create``"""
-    names: list[str] = []
-    current: click.Context | None = ctx
-    while current is not None and current.parent is not None:
-        names.append(current.info_name or "")
-        current = current.parent
-    return " ".join(reversed(names))
-
-
-def report_header(ctx: click.Context, error_message: str | None) -> dict[str, Any]:
-    """The common fields of a report, as arguments for a CommandReport"""
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "status": "error" if error_message else "success",
-        "command": report_command(ctx),
-        "arguments": report_arguments(ctx),
-        "options": report_options(ctx),
-    }
-
-
-def change_error_report(ctx: click.Context, message: str) -> Report:
-    """Report of a failed command that changes an environment"""
-    project: UVRevProject = ctx.params["project"]
-    try:
-        revision: Revision | None = get_last_revision_number(project)
-    except (click.ClickException, OSError):
-        # broken or missing environment
-        revision = None
-    return Report.from_error(
-        report_command(ctx),
-        report_arguments(ctx),
-        revision,
-        message,
-        report_options(ctx),
-    )
-
-
-def find_project(
-    ctx: click.Context | None, param: click.Parameter | None, value: str | None
-) -> UVRevProject:
-    """Find the environment for --env (see README, Environment Selection)"""
-    settings = get_settings(ctx)
-    if value is None and (venv := os.getenv("VIRTUAL_ENV")) and venv != sys.prefix:
-        proj = UVRevProject(Path(venv).parent, settings)
-        if proj.exists():
-            warn_if_incomplete(proj)
-            return proj
-        warning(
-            f"Currently activated VIRTUAL_ENV ({venv}) is not a uvrev env. Ignoring."
-        )
-
-    name = value or constants.DEFAULT_ENV
-    proj = UVRevProject(get_base_dir() / name, settings)
-
-    if not proj.exists():
-        raise click.BadParameter(
-            f"Project '{name}' does not exist. Create it with 'uvrev env create'",
-            ctx=ctx,
-            param=param,
-        )
-
-    warn_if_incomplete(proj)
-    return proj
-
-
-def env_option_callback(
-    ctx: click.Context | None, param: click.Parameter | None, value: str | None
-) -> UVRevProject:
-    try:
-        return find_project(ctx, param, value)
-    except click.ClickException as e:
-        if ctx is None:
-            raise
-        # raised by ReportingCommand.invoke, the command is not executed
-        ctx.meta[DEFERRED_ERROR] = e
-        return UVRevProject(Path(value or constants.DEFAULT_ENV))
-
-
-def env_option[F: Callable[..., Any]](f: F) -> F:
-    """Reusable option decorator for environment selection with project lookup"""
-
-    return click.option(
-        "--env",
-        "-e",
-        "project",
-        default=None,
-        envvar=constants.ENV_VARIABLE,
-        callback=env_option_callback,
-        help="Project/environment name (default: environment variable UVREV_ENV, "
-        "then the activated uvrev environment, then 'base')",
-    )(f)
-
-
-def json_option[F: Callable[..., Any]](f: F) -> F:
-    """Reusable option decorator to print a JSON report of the changes"""
-
-    return click.option(
-        "--json",
-        "as_json",
-        is_flag=True,
-        default=False,
-        help="Print a JSON report of the changes to stdout, logs go to stderr",
-    )(f)
-
-
-def verify_option[F: Callable[..., Any]](f: F) -> F:
-    """Reusable option decorator to verify and fix the venv after a change"""
-
-    return click.option(
-        "--verify/--no-verify",
-        "verify_after",
-        default=None,
-        help="Run 'uvrev verify --fix' afterwards "
-        "(default: setting verify_after_change)",
-    )(f)
-
-
-def dry_run_option[F: Callable[..., Any]](f: F) -> F:
-    """Reusable option decorator to only report what a command would change"""
-
-    return click.option(
-        "--dry-run",
-        is_flag=True,
-        default=False,
-        help="Only report what would change: the environment, its files and "
-        "its revisions are not touched",
-    )(f)
-
-
-def echo_problems(problems: tuple[Problem, ...], err: bool = False) -> None:
-    for problem in problems:
-        click.secho(
-            f"{'⚠️' if problem.is_warning else '❌'} {problem}",
-            fg="yellow" if problem.is_warning else "red",
-            err=err,
-        )
-
-
-def run_operation(
-    project: UVRevProject,
-    as_json: bool,
-    verify_after: bool | None,
-    operation: Callable[[], RevisionChange],
-    dry_run: bool = False,
-    repair_first: bool = True,
-) -> RevisionChange:
-    """Run an operation that changes an environment.
-
-    An environment that is marked as unprotected (``uvrev unprotect``) is
-    repaired first, unless the operation creates the venv anew anyway
-    (``repair_first``) or nothing may be changed (``dry_run``).
-
-    Afterwards the venv is verified and fixed, if requested (``--verify`` or the
-    setting ``verify_after_change``), and the JSON report is printed with --json.
-    Failures of the operation are reported by ReportingCommand.
-
-    If the venv can not be fixed, the report contains the change (which is
-    done) with status "error" and the program exits with exit code 1.
-
-    In a dry run the operation only predicts the change: the venv is not
-    verified and the changelog of the change is shown instead.
-    """
-    repaired = repair(project) if repair_first and not dry_run else None
-    change = operation()
-    ctx = click.get_current_context()
-    if dry_run:
-        verify_after = False
-        click.echo(changelog_of(change), err=True)
-        success("Dry run: nothing was changed.")
-    elif verify_after is None:
-        verify_after = project.settings.verify_after_change
-    result = get_services(ctx).verify(project, True) if verify_after else None
-    message = None
-    if result is not None:
-        # stdout may contain the JSON report
-        echo_problems(result.remaining, err=True)
-        if result.errors:
-            message = f"{len(result.errors)} problem(s) could not be fixed"
-    if as_json:
-        report = Report.from_change(
-            report_command(ctx),
-            report_arguments(ctx),
-            change,
-            report_options(ctx),
-            result,
-            message,
-            repaired,
-        )
-        click.echo(report.to_json())
-    if message:
-        fatal_error(message)
-    return change
+from .tool import run_tool
+from .types import Revision, UVRevProject
+from .verify import VerifyResult
 
 
 @click.group(cls=UvrevGroup)
@@ -449,18 +83,13 @@ def env() -> None:
     """Manage environments"""
 
 
-def python_request_callback(
-    _ctx: click.Context | None, _param: click.Parameter | None, value: str | None
-) -> str | None:
-    """A relative path of an interpreter refers to the working directory"""
-    return absolute_python_request(value, Path.cwd()) if value else value
-
-
 def env_create_report(
     ctx: click.Context, created: bool, error_message: str | None = None
 ) -> EnvCreateReport:
+    # also the report of a failure, which may be that the settings are invalid
     project = UVRevProject(
-        get_base_dir() / (ctx.params.get("name") or constants.DEFAULT_ENV)
+        get_base_dir() / (ctx.params.get("name") or constants.DEFAULT_ENV),
+        get_settings_or_defaults(ctx),
     )
     version = get_python_version(project)
     return EnvCreateReport(
@@ -519,10 +148,10 @@ def env_create(
     versions before 0.4. Run 'uvrev env fix NAME' for those first.
     """
     project_name = name or constants.DEFAULT_ENV
-    project = UVRevProject(get_base_dir() / project_name)
+    project = named_project(ctx, name)
     created = not project.created_successfully()
     if created:
-        create_env(get_base_dir(), project_name, python, force, get_settings(ctx))
+        create_env(get_base_dir(), project_name, project.settings, python, force)
         success(f"Project '{project_name}' created at {project.project_path}")
     else:
         success(f"Project '{project_name}' already exists at {project.project_path}")
@@ -549,7 +178,7 @@ def env_fix(name: str | None) -> None:
     'uvrev env create' does (identity of uvrev, no signing).
     """
     project_name = name or constants.DEFAULT_ENV
-    project = UVRevProject(get_base_dir() / project_name)
+    project = named_project(click.get_current_context(), name)
     if not project.exists():
         fatal_error(f"Project '{project_name}' does not exist")
     if (project.project_path / ".git" / "HEAD").is_file():
@@ -573,10 +202,12 @@ def env_list() -> None:
         return
 
     click.echo("Projects:")
+    ctx = click.get_current_context()
     for proj in projects:
-        incomplete = not UVRevProject(get_base_dir() / proj).created_successfully()
+        incomplete = not named_project(ctx, proj).created_successfully()
         click.echo(
-            f"  • {proj}" + (INCOMPLETE_HINT.format(name=proj) if incomplete else "")
+            f"  • {proj}"
+            + (constants.INCOMPLETE_HINT.format(name=proj) if incomplete else "")
         )
 
 
@@ -622,15 +253,11 @@ def add(
         uvrev add --python /usr/bin/python3.14 pandas    # ... to this interpreter
         uvrev add --dry-run pandas        # Show what adding pandas would change
     """
-    change = run_operation(
-        project,
-        as_json,
-        verify_after,
-        lambda: add_packages(project, packages, upgrade_all, python, dry_run),
-        dry_run,
-    )
-    if change.created:
-        success(f"Created revision {change.revision}")
+    change = plan_add(packages, upgrade_all, python)
+    outcome = apply_change(project, change, dry_run, verifier(project, verify_after))
+    report_outcome(outcome, as_json, dry_run)
+    if outcome.change.created:
+        success(f"Created revision {outcome.change.revision}")
 
 
 @cli.command(
@@ -662,17 +289,20 @@ def remove(
         uvrev remove pandas
         uvrev remove --ignore-missing pandas numpy   # fine if they are not installed
     """
-    change = run_operation(
-        project,
-        as_json,
-        verify_after,
-        lambda: remove_packages(project, packages, ignore_missing, dry_run),
-        dry_run,
-    )
+    if ignore_missing:
+        packages, missing = split_missing(project, packages)
+        if missing:
+            warning(f"Not a dependency, skipped: {', '.join(missing)}")
+    change = plan_remove(packages)
+    outcome = apply_change(project, change, dry_run, verifier(project, verify_after))
+    report_outcome(outcome, as_json, dry_run)
     if dry_run:
         return
-    if change.created:
-        success(f"Removed {' '.join(packages)}.  Created revision {change.revision}.")
+    if outcome.change.created:
+        success(
+            f"Removed {' '.join(packages)}.  "
+            f"Created revision {outcome.change.revision}."
+        )
     else:
         success("Nothing to remove.")
 
@@ -699,13 +329,8 @@ def sync(
     the cache of uv (all of it) and the virtual environment and installs
     everything again.
     """
-    run_operation(
-        project,
-        as_json,
-        verify_after,
-        lambda: sync_packages(project, clean),
-        repair_first=not clean,
-    )
+    outcome = sync_packages(project, clean, verifier(project, verify_after))
+    report_outcome(outcome, as_json)
     success("Sync complete.")
 
 
@@ -740,23 +365,18 @@ def upgrade(
         uvrev upgrade --python 3.14    # Upgrade all packages and switch to Python 3.14
         uvrev upgrade --python /usr/bin/python3.14    # ... to this interpreter
     """
-    change = run_operation(
-        project,
-        as_json,
-        verify_after,
-        lambda: upgrade_packages(project, packages, dry_run, python),
-        dry_run,
-    )
+    change = plan_upgrade(packages, python)
+    outcome = apply_change(project, change, dry_run, verifier(project, verify_after))
+    report_outcome(outcome, as_json, dry_run)
     if dry_run:
         return
-    if not change.created:
+    revision = outcome.change.revision
+    if not outcome.change.created:
         success("Everything is already up to date.")
     elif packages:
-        success(
-            f"Upgraded {len(packages)} package(s), created revision {change.revision}"
-        )
+        success(f"Upgraded {len(packages)} package(s), created revision {revision}")
     else:
-        success(f"Upgraded all packages, created revision {change.revision}")
+        success(f"Upgraded all packages, created revision {revision}")
 
 
 @cli.command(
@@ -791,19 +411,17 @@ def upgrade_python_cmd(
         uvrev upgrade-python '>=3.13,<3.15'
         uvrev upgrade-python /usr/bin/python3.14    # path of an interpreter
     """
-    change = run_operation(
-        project,
-        as_json,
-        verify_after,
-        lambda: upgrade_python(project, request, dry_run),
-        dry_run,
-    )
+    change = plan_upgrade_python(request)
+    outcome = apply_change(project, change, dry_run, verifier(project, verify_after))
+    report_outcome(outcome, as_json, dry_run)
     if dry_run:
         return
-    if not change.created:
+    if not outcome.change.created:
         success(f"Python {request} is already used.")
     else:
-        success(f"Changed Python to {request}, created revision {change.revision}")
+        success(
+            f"Changed Python to {request}, created revision {outcome.change.revision}"
+        )
 
 
 @cli.command("list")
@@ -828,19 +446,31 @@ def history(project: UVRevProject) -> None:
     click.echo(output)
 
 
-@cli.command(error_report=change_error_report)
+@cli.command(error_report=change_error_report, report_options=("dry_run",))
 @click.argument("revision", type=int)
+@dry_run_option
 @env_option
 @json_option
 @verify_option
 def restore(
-    project: UVRevProject, revision: Revision, as_json: bool, verify_after: bool | None
+    project: UVRevProject,
+    revision: Revision,
+    dry_run: bool,
+    as_json: bool,
+    verify_after: bool | None,
 ) -> None:
-    """Restore project to a specific revision"""
-    run_operation(
-        project, as_json, verify_after, lambda: restore_revision(project, revision)
-    )
-    success(f"Restored to revision {revision}")
+    """Restore project to a specific revision
+
+    \b
+    Examples:
+        uvrev restore 3
+        uvrev restore --dry-run 3    # Show what restoring revision 3 would change
+    """
+    change = plan_restore(revision)
+    outcome = apply_change(project, change, dry_run, verifier(project, verify_after))
+    report_outcome(outcome, as_json, dry_run)
+    if not dry_run:
+        success(f"Restored to revision {revision}")
 
 
 @cli.command()
@@ -1006,22 +636,23 @@ def verify_cmd(
 ) -> None:
     """Check the venv against the RECORD files of the installed packages
 
-    Finds missing or modified files, untracked files and packages not in sync
-    with uv.lock. With --fix the affected packages are removed from the uv
-    cache and reinstalled, and the venv is protected again (if enabled).
-    Untracked files are only reported.
+    Finds missing or modified files, files that no package installed and
+    packages not in sync with uv.lock. With --fix the affected packages are
+    removed from the uv cache and reinstalled, files that no package installed
+    are removed, and the venv is protected again (if enabled).
 
-    The exit code is 1 if problems remain (warnings don't count).
+    The exit code is 1 if problems remain.
     """
     result = get_services(ctx).verify(project, fix)
     # stdout is reserved for the report
     echo_problems(result.remaining, err=as_json)
     message = None
-    if result.errors and fix:
-        message = f"{len(result.errors)} problem(s) could not be fixed"
-    elif result.errors:
+    if result.remaining and fix:
+        message = not_fixed(result.remaining)
+    elif result.remaining:
         message = (
-            f"{len(result.errors)} problem(s) found, fix them with 'uvrev verify --fix'"
+            f"{len(result.remaining)} problem(s) found, "
+            "fix them with 'uvrev verify --fix'"
         )
     if as_json:
         click.echo(verify_report(ctx, result, message).to_json())
@@ -1033,7 +664,7 @@ def verify_cmd(
 @cli.command()
 def settings() -> None:
     """Show the settings and where they are loaded from"""
-    click.echo(f"# {uvrev_settings.config_file()} (and files in UVREV_SETTINGS)")
+    click.echo(f"# {constants.config_file()} (and files in UVREV_SETTINGS)")
     click.echo("[uvrev]")
     for name, value in vars(get_settings(click.get_current_context())).items():
         click.echo(f"{name} = {toml_value(value)}")
@@ -1096,17 +727,14 @@ def tool_run(
         uvrev tool run --from mytool==1.2 --extra fast mytool-cli -v
         uvrev tool run --from ./dist/mytool-1.2-py3-none-any.whl mytool
     """
-    try:
-        exit_code = run_tool(
-            command,
-            args,
-            from_spec,
-            extras,
-            python,
-            refresh,
-            get_settings(click.get_current_context()),
-            get_services(click.get_current_context()).tool,
-        )
-    except ToolError as e:
-        fatal_error(str(e))
+    exit_code = run_tool(
+        command,
+        args,
+        from_spec,
+        extras,
+        python,
+        refresh,
+        get_settings(click.get_current_context()),
+        get_services(click.get_current_context()).tool,
+    )
     sys.exit(exit_code)

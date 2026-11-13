@@ -1,16 +1,22 @@
-import shlex
-import subprocess
+"""Basic types used by all modules: the project of an environment and its paths.
+
+``UVRevProject`` knows where the files of an environment are, not what is in
+them. This module only imports ``constants`` of uvrev. Also home of ``Revision``.
+"""
+
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NewType
+from typing import TYPE_CHECKING, NewType
 
-import click
 from packaging.requirements import Requirement
 from packaging.utils import NormalizedName, canonicalize_name
 
 from . import constants
-from .settings import Settings
+
+if TYPE_CHECKING:
+    # only for type checkers: this module must only import constants of uvrev
+    from .settings import Settings
 
 Revision = NewType("Revision", int)
 
@@ -20,15 +26,16 @@ class UVRevProject:
     """Represents a UV project with revision tracking"""
 
     project_path: Path
-    settings: Settings = field(default_factory=Settings, compare=False)
+    # always the loaded settings: the caller does not have to know who uses them
+    settings: "Settings" = field(compare=False)
 
     @property
     def pyproject_path(self) -> Path:
-        return self.project_path / "pyproject.toml"
+        return self.project_path / constants.PYPROJECT_FILE
 
     @property
     def lock_path(self) -> Path:
-        return self.project_path / "uv.lock"
+        return self.project_path / constants.LOCK_FILE
 
     @property
     def python_version_path(self) -> Path:
@@ -39,6 +46,16 @@ class UVRevProject:
     def python_lock_path(self) -> Path:
         """Exact version of the Python interpreter of the environment"""
         return self.project_path / constants.PYTHON_VERSION_LOCK_FILE
+
+    @property
+    def source_paths(self) -> tuple[Path, ...]:
+        """The files that define the environment, changed by uv and uvrev"""
+        return (self.pyproject_path, self.lock_path, self.python_version_path)
+
+    @property
+    def tracked_paths(self) -> tuple[Path, ...]:
+        """The files whose state is tracked in the revisions"""
+        return (*self.source_paths, self.python_lock_path)
 
     @property
     def venv_path(self) -> Path:
@@ -85,8 +102,9 @@ class UVRevProject:
         Check if project exists
 
         >>> import tempfile
+        >>> from uvrev.settings import Settings
         >>> with tempfile.TemporaryDirectory() as td:
-        ...     p = UVRevProject(Path(td))
+        ...     p = UVRevProject(Path(td), Settings())
         ...     p.exists()
         False
         """
@@ -104,15 +122,3 @@ class NormalizedRequirement(Requirement):
     def __init__(self, requirement_string: str):
         super().__init__(requirement_string)
         self.name = canonicalize_name(self.name)
-
-
-class SubprocessFailure(click.ClickException):
-    """
-    SubprocessFailure Exception that will quit the program without stacktrace
-    """
-
-    def __init__(self, error: subprocess.CalledProcessError) -> None:
-        if isinstance(error.cmd, tuple):  # pragma: no branch
-            error.cmd = shlex.join(error.cmd)
-        self.error = error
-        super().__init__(str(error))

@@ -15,12 +15,12 @@ from click.testing import CliRunner
 from packaging.utils import NormalizedName
 from packaging.version import Version
 
+from uvrev import constants
 from uvrev.cli import cli
 from uvrev.commands import UvRunner, uv_tool
-from uvrev.exceptions import ToolError
+from uvrev.exceptions import SubprocessFailure, ToolError
 from uvrev.settings import Settings
 from uvrev.tool import (
-    RECEIPT_NAME,
     EmbeddedProject,
     ToolRequest,
     ToolServices,
@@ -42,7 +42,6 @@ from uvrev.tool import (
     tool_request,
     uv_environment,
 )
-from uvrev.types import SubprocessFailure
 
 SHA = "ab" * 32
 NAME = NormalizedName("my-tool")
@@ -436,12 +435,12 @@ class TestReceipt:
     )
     def test_incomplete(self, tmp_path: Path, content: str | None) -> None:
         if content is not None:
-            (tmp_path / RECEIPT_NAME).write_text(content)
+            (tmp_path / constants.RECEIPT_NAME).write_text(content)
         assert not has_receipt(tmp_path, REQUEST)
 
     def test_complete(self, tmp_path: Path) -> None:
         receipt = json.dumps({"package": "my-tool", "version": "1.0"})
-        (tmp_path / RECEIPT_NAME).write_text(receipt)
+        (tmp_path / constants.RECEIPT_NAME).write_text(receipt)
         assert has_receipt(tmp_path, REQUEST)
 
 
@@ -477,14 +476,16 @@ class TestEnvironment:
             directory = tool_directory(REQUEST)
             directory.mkdir(parents=True)
             receipt = {"package": NAME, "version": "1.0", "wheel_sha256": None}
-            (directory / RECEIPT_NAME).write_text(json.dumps(receipt))
+            (directory / constants.RECEIPT_NAME).write_text(json.dumps(receipt))
             yield
 
         def fail(*_: Any) -> None:
             raise AssertionError("must not build")
 
         services = ToolServices(lock=lock_held_by_parallel_run, build=fail)
-        directory = ensure_environment(REQUEST, refresh=False, services=services)
+        directory = ensure_environment(
+            REQUEST, refresh=False, settings=Settings(), services=services
+        )
         assert directory == tool_directory(REQUEST)
 
     def test_failed_build_is_removed(self) -> None:
@@ -496,7 +497,10 @@ class TestEnvironment:
 
         with pytest.raises(KeyboardInterrupt):
             ensure_environment(
-                REQUEST, refresh=False, services=ToolServices(build=interrupted)
+                REQUEST,
+                refresh=False,
+                settings=Settings(),
+                services=ToolServices(build=interrupted),
             )
         assert not tool_directory(REQUEST).exists()
 
@@ -540,7 +544,7 @@ class TestRunTool:
     @pytest.mark.parametrize("command", ["", "bin/tool", "..\\tool"])
     def test_invalid_command(self, command: str) -> None:
         with pytest.raises(ToolError, match="COMMAND must be the name"):
-            run_tool(command, (), "my-tool==1.0", (), None, False)
+            run_tool(command, (), "my-tool==1.0", (), None, False, Settings())
 
     def test_cli_error(self) -> None:
         result = CliRunner().invoke(cli, args=("tool", "run", "./tool"))
