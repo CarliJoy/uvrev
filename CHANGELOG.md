@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.7.1] (2026-11-19)
 
 ### Changed
 
@@ -272,6 +272,7 @@ First real release.
 - `uvrev history` shows the revisions and `uvrev restore` goes back to a previous one.
 - `uvrev path` shows the location of an environment.
 
+[0.7.1]: https://gitlab.com/Kound/uvrev/-/compare/0.7...0.7.1
 [0.7]: https://gitlab.com/Kound/uvrev/-/compare/0.6...0.7
 [0.6]: https://gitlab.com/Kound/uvrev/-/compare/0.5...0.6
 [0.5]: https://gitlab.com/Kound/uvrev/-/compare/0.4...0.5
