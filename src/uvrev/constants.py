@@ -18,6 +18,8 @@ DEFAULT_ENV: Final[str] = "base"
 # environment variable with the name of the environment, if --env is not given
 ENV_VARIABLE: Final[str] = "UVREV_ENV"
 INITIAL_COMMIT_MSG: Final[str] = "(rev 0) Initial project creation"
+# branch of the revisions in the git repository of an environment
+DEFAULT_BRANCH: Final[str] = "main"
 PYPROJECT_FILE: Final[str] = "pyproject.toml"
 LOCK_FILE: Final[str] = "uv.lock"
 # Python request (e.g. a version or range), written by uv python pin and read by uv
@@ -28,6 +30,10 @@ PYTHON_VERSION_LOCK_FILE: Final[str] = ".python-version.lock"
 CREATED_MARKER_FILE: Final[str] = ".uvrev_created_successfully"
 # in the venv: uv locks the venv with it, also to only read it (uv sync --check)
 VENV_LOCK_FILE: Final[str] = ".lock"
+# in the venv: its configuration, written by uv (e.g. the version of the interpreter)
+VENV_CONFIG_FILE: Final[str] = "pyvenv.cfg"
+# files in the root of a protected venv that stay writable for the owner
+WRITABLE_VENV_FILES: Final[tuple[str, ...]] = (VENV_LOCK_FILE, VENV_CONFIG_FILE)
 # exists while the venv is unprotected by ``uvrev unprotect``, see marker.py
 UNPROTECTED_MARKER_FILE: Final[str] = ".unprotected"
 # name of the entry for Python where it is compared like a package
@@ -111,10 +117,10 @@ SUPPORTED_SPEC: Final[str] = (
 # Problems fixed by reinstalling the package
 REINSTALL_PROBLEMS: Final[frozenset[str]] = frozenset({"missing", "modified"})
 # The files a venv consists of itself, they are not installed by a package and
-# can not be verified or restored (only by creating the venv again).
+# can not be verified. ``uv venv --allow-existing`` creates them again in place.
 # In the root of the venv:
 VENV_ROOT_FILES: Final[frozenset[str]] = frozenset(
-    {"pyvenv.cfg", ".gitignore", "CACHEDIR.TAG", VENV_LOCK_FILE}
+    {VENV_CONFIG_FILE, ".gitignore", "CACHEDIR.TAG", VENV_LOCK_FILE}
 )
 # next to the interpreter (bin or Scripts):
 VENV_SCRIPTS: Final[frozenset[str]] = frozenset(
@@ -145,13 +151,14 @@ PROBLEM_DESCRIPTIONS: Final[Mapping[str, str]] = MappingProxyType(
         "modified": "modified",
         "not_synced": "not in sync with uv.lock",
         "untracked": "not installed by any package",
+        "venv_file": "file of the virtual environment itself changed",
     }
 )
 
 # --- repair.py
 # Files of the venv itself that uv creates or rewrites while using the venv
-# (e.g. its lock). A change of them is harmless.
-VOLATILE_VENV_FILES: Final[frozenset[str]] = frozenset(VENV_ROOT_FILES - {"pyvenv.cfg"})
+# (e.g. its lock and its configuration). A change of them is harmless.
+VOLATILE_VENV_FILES: Final[frozenset[str]] = VENV_ROOT_FILES
 
 
 def config_file() -> Path:
